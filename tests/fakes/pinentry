@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Fake pinentry speaking Assuan. Answers GETPIN with the next line of $FAKE_PINS
+(an empty line means cancel) and logs each GETPIN and SETERROR to $FAKE_PIN_LOG.
+
+With FAKE_PINENTRY_STYLE=rofi it mimics pinentry-rofi: SETTIMEOUT is an unknown
+command, and after any error no command gets an OK until a GETPIN succeeds.
+With FAKE_PINENTRY_STYLE=bemenu it mimics pinentry-bemenu: SETTIMEOUT is an
+unknown command, and every other command keeps working."""
+
+import os
+import sys
+
+
+def log(text: str) -> None:
+    with open(os.environ["FAKE_PIN_LOG"], "a") as f:
+        f.write(text + "\n")
+
+
+def next_pin() -> str:
+    path = os.environ["FAKE_PINS"]
+    with open(path) as f:
+        pins = f.read().split("\n")
+    with open(path, "w") as f:
+        f.write("\n".join(pins[1:]))
+    return pins[0] if pins else ""
+
+
+style = os.environ.get("FAKE_PINENTRY_STYLE")
+rofi_style = style == "rofi"
+ok = True
+
+print("OK Pleased to meet you", flush=True)
+for line in sys.stdin:
+    cmd = line.rstrip("\n")
+    if style in ("rofi", "bemenu") and cmd.startswith("SETTIMEOUT"):
+        print(f'ERR 275 Unknown command "{cmd}"', flush=True)
+        ok = not rofi_style
+        continue
+    if cmd.startswith("GETPIN"):
+        log("GETPIN")
+        pin = next_pin()
+        if not pin:
+            print("ERR 83886179 Operation cancelled <Pinentry>", flush=True)
+            continue
+        if pin == "!no-tty":  # what pinentry-curses answers without a terminal
+            print("ERR 83918950 Inappropriate ioctl for device <Pinentry>", flush=True)
+            continue
+        print("D " + pin.replace("%", "%25"), flush=True)
+        ok = True
+    elif cmd.startswith("SETERROR"):
+        log(cmd)
+    elif cmd.startswith("BYE"):
+        print("OK closing connection", flush=True)
+        break
+    if ok or not rofi_style:
+        print("OK", flush=True)

@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Fake wtype: logs keys and the text read from stdin."""
+
+import json
+import os
+import sys
+
+argv = sys.argv[1:]
+event = {"tool": "wtype", "argv": argv}
+if argv == ["-"]:
+    event["text"] = sys.stdin.read()
+with open(os.environ["FAKE_TYPED"], "a") as log:
+    log.write(json.dumps(event) + "\n")

@@ -1,0 +1,65 @@
+# rofi-passage sample configuration.
+#
+# Copy to ~/.config/rofi-passage/config.toml (or $XDG_CONFIG_HOME/rofi-passage/)
+# and change what you need. Every key is optional; the values below are the
+# defaults. The file is parsed as TOML, never executed.
+
+# Password store. When unset: $PASSAGE_DIR, then ~/.passage/store.
+# Set it here if your window manager does not see your shell's PASSAGE_DIR.
+# store = "~/.passage/store"
+
+# Menu program: auto | rofi | fuzzel | wofi | bemenu.
+# auto picks rofi (2.0+ on Wayland), then fuzzel, wofi, bemenu.
+launcher = "auto"
+
+# Typing tool for autotype: auto | wtype | ydotool | xdotool.
+# auto picks xdotool on X11, wtype then ydotool on Wayland.
+typing_tool = "auto"
+
+# Seconds before a copied secret is cleared from the clipboard. The previous
+# text comes back, unless you copied something else in the meantime.
+clipboard_timeout = 45
+
+# Action run by Enter in the entry menu: autotype, copy-password,
+# copy-username, copy-totp, type-password, type-totp, open-url, recovery,
+# show-fields. Launchers without custom keys list it first in the action menu.
+default_action = "autotype"
+
+# Autotype sequence for entries without an `autotype:` line.
+# Tokens: username, password, otp, :tab, :enter, :space, :delay (500 ms).
+# Unknown tokens abort the action; they are never typed.
+autotype = "username :tab password :enter"
+
+# Milliseconds to wait before the first key, so the menu can close and focus
+# can return to the target window. It counts from when the last menu or
+# passphrase prompt closed, so time spent decrypting is not added on top.
+# Raise it if the first characters go missing.
+type_delay_ms = 100
+
+# Length of generated passwords (new entry, regenerate).
+password_length = 25
+
+# Use age-agent when it is installed (one passphrase per session instead of
+# one per run). Set to false to always unlock per run.
+use_agent = true
+
+# Pinentry program for the per-run unlock (without age-agent). The default,
+# "pinentry", means: the launcher's own pinentry when installed
+# (pinentry-rofi with rofi, pinentry-bemenu with bemenu), else the first
+# graphical pinentry found (gnome3 in a GNOME session only, then qt, gtk, fltk,
+# x11), else plain `pinentry`. Terminal pinentries (curses, tty) cannot prompt
+# when rofi-passage is started from a hotkey.
+pinentry = "pinentry"
+
+# Hotkeys in the entry menu. rofi only: other launchers show the action menu.
+# Use rofi's key syntax; an empty string disables a binding.
+[keys]
+copy_password = "Alt+1"
+copy_username = "Alt+2"
+copy_totp = "Alt+3"
+type_password = "Alt+4"
+type_totp = "Alt+5"
+open_url = "Alt+u"
+new = "Alt+n"          # not implemented yet
+sync = "Alt+s"         # not implemented yet
+action_menu = "Alt+m"  # recovery codes, show fields, ...
