@@ -48,6 +48,10 @@ class Passage:
     @staticmethod
     def _error(proc: subprocess.CompletedProcess[bytes], what: str) -> RofiPassageError:
         lines = proc.stderr.decode(errors="replace").strip().splitlines()
+        # age ends with "report unexpected or unhelpful errors at …": prefer
+        # its "error:" line, which says what went wrong.
+        errors = [line for line in lines if "error:" in line and "report" not in line]
+        lines = errors or [line for line in lines if "filippo.io/age/report" not in line]
         reason = lines[-1][:160] if lines else f"exit {proc.returncode}"
         return RofiPassageError(f"{what}: {store.display_name(reason)}")
 

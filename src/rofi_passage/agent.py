@@ -4,6 +4,10 @@ Per-run mode decrypts the identities file once per run: the passphrase comes
 from pinentry, `age -d` reads it from a private pseudo-terminal, and the
 decrypted identity is kept in a sealed memfd that passage reads as
 `/dev/fd/N`. Nothing touches disk, argv or the environment except that path.
+
+Agent mode decrypts through age-agent's stub identities file, and unlocks a
+locked agent over its socket with a passphrase from our own pinentry: the
+`age-agent unlock` command only prompts on a terminal.
 """
 
 from __future__ import annotations
@@ -16,9 +20,12 @@ import json
 import os
 import pty
 import select
+import socket
+import struct
 import subprocess
 import termios
 import time
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +39,9 @@ AGE_ARMOR = b"-----BEGIN AGE ENCRYPTED FILE-----"
 PROMPT_TIMEOUT = 60
 ATTEMPTS = 3
 MAX_IDENTITY = 1 << 20
+AGENT_STUB = b"AGE-PLUGIN-AGENT-"
+AGENT_PROTOCOL = 1
+AGENT_MAX_MESSAGE = 64 * 1024
 
 
 class Mode(enum.Enum):
@@ -46,6 +56,7 @@ class Detection:
     mode: Mode
     identities: Path
     agent_status: dict[str, Any] = field(default_factory=dict)
+    agent_unused: bool = False  # age-agent answers, but is not set up for this file
 
 
 def identities_path() -> Path:
@@ -65,14 +76,15 @@ def _run_agent(*args: str, timeout: float | None = 10) -> subprocess.CompletedPr
 
 
 def agent_status() -> tuple[int, dict[str, Any]] | None:
-    """(exit code, parsed JSON) of `age-agent status --json`, or None if unusable."""
+    """(exit code, parsed JSON) of `age-agent status --json`, or None if unusable.
+    Exit 0 unlocked, 1 locked, 2 no daemon running."""
     if tools.which("age-agent") is None:
         return None
     try:
         proc = _run_agent("status", "--json")
     except (OSError, subprocess.TimeoutExpired):
         return None
-    if proc.returncode not in (0, 1):
+    if proc.returncode not in (0, 1, 2):
         return None
     try:
         data = json.loads(proc.stdout or "{}")
@@ -105,23 +117,70 @@ def classify(content: bytes | bytearray) -> Mode | None:
     return None
 
 
+def _is_agent_stub(content: bytes) -> bool:
+    return any(line.strip().startswith(AGENT_STUB) for line in content.splitlines())
+
+
+def _agent_config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
+    return Path(base).expanduser() / "age-agent"
+
+
+def agent_stub_for(identities: Path) -> Path | None:
+    """age-agent's stub file, when its config.toml serves `identities`.
+
+    `age-agent setup <file>` writes the stub and asks the user to export
+    PASSAGE_IDENTITIES_FILE, which a hotkey launch often does not see, so the
+    stub is looked up here instead of trusting the environment."""
+    cfg_dir = _agent_config_dir()
+    stub = cfg_dir / "identities.txt"
+    try:
+        with (cfg_dir / "config.toml").open("rb") as f:
+            cfg = tomllib.load(f)
+        if not _is_agent_stub(stub.read_bytes()):
+            return None
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    entries = cfg.get("identity")
+    for entry in entries if isinstance(entries, list) else []:
+        file = entry.get("file") if isinstance(entry, dict) else None
+        if not isinstance(file, str):
+            continue
+        with contextlib.suppress(OSError):
+            if os.path.samefile(Path(file).expanduser(), identities):
+                return stub
+    return None
+
+
 def detect(use_agent: bool = True) -> Detection:
-    """UNL-1: agent first, then the identities file's content."""
+    """UNL-1: agent mode when age-agent is installed and serves the identities
+    file (directly, or through the stub its setup wrote), else the mode
+    implied by the file's content."""
     path = identities_path()
-    if use_agent:
-        status = agent_status()
-        if status is not None:
-            return Detection(Mode.AGENT, path, status[1])
     try:
         with path.open("rb") as f:
             content = f.read(MAX_IDENTITY)
     except OSError as e:
         raise RofiPassageError(f"Cannot read identities file {path}: {e.strerror}") from e
     mode = classify(content)
+    stub_in_use = _is_agent_stub(content)
     del content
+    plugin = tools.which("age-plugin-agent") is not None
+    if stub_in_use and not plugin:
+        raise RofiPassageError(
+            f"{path} holds age-agent stubs but age-plugin-agent is not on PATH; "
+            "install it or point PASSAGE_IDENTITIES_FILE back to the encrypted identities file"
+        )
+    status = agent_status() if use_agent and plugin else None
+    if status is not None:
+        if stub_in_use:
+            return Detection(Mode.AGENT, path, status[1])
+        stub = agent_stub_for(path) if mode is Mode.PER_RUN else None
+        if stub is not None:
+            return Detection(Mode.AGENT, stub, status[1])
     if mode is None:
         raise RofiPassageError(f"No age identity found in {path}")
-    return Detection(mode, path)
+    return Detection(mode, path, agent_unused=status is not None and mode is Mode.PER_RUN)
 
 
 # --- pinentry -----------------------------------------------------------------
@@ -453,6 +512,127 @@ def sealed_memfd(data: bytearray) -> int:
     return fd
 
 
+# --- age-agent socket -------------------------------------------------------
+
+
+def _json_string(raw: bytearray) -> bytearray:
+    """`raw` as the body of a JSON string, built without an immutable copy."""
+    out = bytearray()
+    for b in raw:
+        if b in (0x22, 0x5C):
+            out += bytes((0x5C, b))
+        elif b < 0x20:
+            out += b"\\u%04x" % b
+        else:
+            out.append(b)
+    return out
+
+
+class AgentError(RofiPassageError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"age-agent: {message}")
+        self.code = code
+
+
+class AgentSocket:
+    """Client for age-agent's socket protocol, version 1: each message is a
+    4-byte big-endian length and one JSON object."""
+
+    def __init__(self, path: Path) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(10)
+        try:
+            self.sock.connect(str(path))
+            creds = self.sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            _, uid, _ = struct.unpack("3i", creds)
+            if uid != os.getuid():
+                raise RofiPassageError(f"{path} is served by another user")
+            reply = self.call({"type": "hello", "version": AGENT_PROTOCOL})
+            if reply.get("version") != AGENT_PROTOCOL:
+                raise RofiPassageError("age-agent speaks an unsupported protocol version")
+        except BaseException:
+            self.sock.close()
+            raise
+
+    @staticmethod
+    def path() -> Path:
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if not runtime:
+            raise RofiPassageError("XDG_RUNTIME_DIR is not set; age-agent needs it")
+        return Path(runtime) / "age-agent/agent.sock"
+
+    @classmethod
+    def connect_or_start(cls) -> AgentSocket:
+        path = cls.path()
+        try:
+            return cls(path)
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass
+        # Waits until the daemon accepts connections, up to 3 s.
+        try:
+            proc = _run_agent("daemon")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise RofiPassageError(f"Cannot start age-agent: {e}") from e
+        if proc.returncode != 0 and "already running" not in proc.stderr:
+            raise RofiPassageError(f"Cannot start age-agent: {proc.stderr.strip()[:160]}")
+        return cls(path)
+
+    def _send(self, payload: bytearray) -> None:
+        frame = bytearray(4 + len(payload))
+        frame[:4] = len(payload).to_bytes(4, "big")
+        frame[4:] = payload
+        try:
+            self.sock.sendall(frame)
+        finally:
+            frame[:] = bytes(len(frame))
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise RofiPassageError("age-agent closed the connection")
+            buf += chunk
+        return bytes(buf)
+
+    def _reply(self) -> dict[str, Any]:
+        n = int.from_bytes(self._recv_exact(4), "big")
+        if n > AGENT_MAX_MESSAGE:
+            raise RofiPassageError("age-agent sent an oversized message")
+        reply = json.loads(self._recv_exact(n))
+        if not isinstance(reply, dict):
+            raise RofiPassageError("age-agent sent a malformed reply")
+        error = reply.get("error")
+        if isinstance(error, dict):
+            raise AgentError(str(error.get("code")), str(error.get("message")))
+        return reply
+
+    def call(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._send(bytearray(json.dumps(request).encode()))
+        return self._reply()
+
+    def unlock(self, passphrase: bytearray, epoch: int | None) -> None:
+        """Raises AgentError with code bad_passphrase, cancelled, no_identities…"""
+        body = _json_string(passphrase)
+        payload = bytearray(b'{"type":"unlock","passphrase":"') + body + b'"'
+        body[:] = bytes(len(body))
+        if epoch is not None:
+            payload += b',"epoch":%d' % epoch
+        payload += b"}"
+        try:
+            self._send(payload)
+        finally:
+            payload[:] = bytes(len(payload))
+        # Unlocking runs scrypt on the identity file: allow more than a status.
+        self.sock.settimeout(60)
+        self._reply()
+
+    def close(self) -> None:
+        self.sock.close()
+
+
 # --- the unlocker used by passage calls --------------------------------------
 
 
@@ -488,20 +668,49 @@ class Unlocker:
         self._ready = True
 
     def _unlock_agent(self) -> None:
-        status = agent_status()
-        if status is None:
-            raise RofiPassageError("age-agent stopped responding")
-        if not is_locked(*status):
-            return
-        # age-agent shows its own pinentry; no terminal is involved.
+        # Over the socket with our own pinentry: `age-agent unlock` prompts on
+        # a terminal only, and a hotkey launch has none.
+        conn = AgentSocket.connect_or_start()
         try:
-            proc = _run_agent("unlock", timeout=PROMPT_TIMEOUT + 30)
-        except subprocess.TimeoutExpired as e:
-            raise Cancelled("Unlock timed out") from e
-        except OSError as e:
-            raise RofiPassageError(f"Cannot run age-agent: {e.strerror}") from e
-        if proc.returncode != 0:
-            raise Cancelled("Unlock cancelled")
+            status = conn.call({"type": "status"})
+            if not status.get("locked"):
+                return
+            epoch = status.get("epoch") if isinstance(status.get("epoch"), int) else None
+            pinentry = Pinentry(pick_pinentry(self.pinentry, self.launcher()))
+            try:
+                error = None
+                for _ in range(ATTEMPTS):
+                    passphrase = pinentry.getpin("Passphrase to unlock age-agent", error)
+                    try:
+                        conn.unlock(passphrase, epoch)
+                        return
+                    except AgentError as e:
+                        if e.code != "bad_passphrase":
+                            failure = self._agent_failure(conn, e)
+                            if failure is None:
+                                return
+                            raise failure from e
+                        error = "Wrong passphrase, try again"
+                    finally:
+                        passphrase[:] = bytes(len(passphrase))
+                raise RofiPassageError("Wrong passphrase, giving up after 3 attempts")
+            finally:
+                pinentry.close()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _agent_failure(conn: AgentSocket, e: AgentError) -> Exception | None:
+        """None when the unlock can be ignored, else the error to raise."""
+        if e.code == "cancelled":
+            # The agent was locked or unlocked while we prompted (LCK-1).
+            with contextlib.suppress(RofiPassageError, OSError):
+                if not conn.call({"type": "status"}).get("locked"):
+                    return None
+            return Cancelled("Unlock cancelled by age-agent lock")
+        if e.code == "no_identities":
+            return RofiPassageError("age-agent has no identities; run `age-agent setup`")
+        return e
 
     def _unlock_per_run(self) -> None:
         pinentry = Pinentry(pick_pinentry(self.pinentry, self.launcher()))
@@ -531,6 +740,9 @@ class Unlocker:
 
     def env(self) -> tuple[dict[str, str], tuple[int, ...]]:
         """Environment overrides and inherited fds for a passage call."""
+        if self.mode is Mode.AGENT:
+            # The stub, which PASSAGE_IDENTITIES_FILE may not name (see detect).
+            return {"PASSAGE_IDENTITIES_FILE": str(self.detection.identities)}, ()
         if self._fd is None:
             return {}, ()
         return {"PASSAGE_IDENTITIES_FILE": f"/dev/fd/{self._fd}"}, (self._fd,)

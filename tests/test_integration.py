@@ -3,7 +3,8 @@ typing tool, notifications and pinentry. A watcher samples /proc during every
 run and fails if a test secret shows up in any process's argv or environment.
 
 Skipped unless `age`, `age-keygen` and `passage` are on PATH (or `passage` is
-named by $ROFI_PASSAGE_TEST_PASSAGE).
+named by $ROFI_PASSAGE_TEST_PASSAGE). The age-agent tests also need `age-agent`
+and `age-plugin-agent`, on PATH or in $ROFI_PASSAGE_TEST_AGE_AGENT_DIR.
 """
 
 from __future__ import annotations
@@ -29,6 +30,10 @@ from rofi_passage.agent import _set_ctty
 ROOT = Path(__file__).resolve().parent.parent
 FAKES = Path(__file__).resolve().parent / "fakes"
 PASSAGE = os.environ.get("ROFI_PASSAGE_TEST_PASSAGE") or shutil.which("passage")
+_agent = shutil.which("age-agent")
+AGE_AGENT_DIR = os.environ.get("ROFI_PASSAGE_TEST_AGE_AGENT_DIR") or (
+    str(Path(_agent).parent) if _agent else None
+)
 
 pytestmark = pytest.mark.skipif(
     not (shutil.which("age") and shutil.which("age-keygen") and PASSAGE),
@@ -140,12 +145,20 @@ class Env:
 
 def encrypt_with_passphrase(src: Path, dst: Path, passphrase: str) -> None:
     """`age -p`, answering both passphrase prompts through a pty."""
+    answer_passphrase_prompts(["age", "-p", "-o", str(dst), str(src)], passphrase, 2)
+
+
+def answer_passphrase_prompts(
+    argv: list[str], passphrase: str, prompts: int, env: dict[str, str] | None = None
+) -> None:
+    """Run `argv` on a pty and answer its terminal passphrase prompts."""
     master, slave = pty.openpty()
     proc = subprocess.Popen(
-        ["age", "-p", "-o", str(dst), str(src)],
+        argv,
         stdin=slave,
         stdout=subprocess.DEVNULL,
         stderr=slave,
+        env=env,
         start_new_session=True,
         preexec_fn=_set_ctty,
     )
@@ -153,7 +166,7 @@ def encrypt_with_passphrase(src: Path, dst: Path, passphrase: str) -> None:
     seen = b""
     answered = 0
     deadline = time.monotonic() + 30
-    while answered < 2 and time.monotonic() < deadline:
+    while answered < prompts and time.monotonic() < deadline:
         ready, _, _ = select.select([master], [], [], 1)
         if not ready:
             continue
@@ -314,6 +327,57 @@ def test_per_run_unlock_entry_menu_and_hotkey(run_env: Env) -> None:
     mru = e.tmp / "home/.cache/rofi-passage/mru"
     assert mru.read_text() == "web/other.org/work\n"
     assert mru.stat().st_mode & 0o777 == 0o600
+
+
+def test_age_agent_not_set_up_falls_back_to_per_run(run_env: Env) -> None:
+    # age-agent answers, but no setup serves the encrypted identities file:
+    # agent mode would hand it to age, which has no terminal to prompt on.
+    e = run_env
+    fake_agent = e.tmp / "bin/age-agent"
+    fake_agent.write_text("#!/bin/sh\necho '{\"locked\": false}'\n")
+    fake_agent.chmod(0o755)
+    (e.tmp / "bin/age-plugin-agent").symlink_to(fake_agent)
+    e.pins(PASSPHRASE)
+    proc = e.run("--entry", "web/example.com", "--action", "copy-username")
+    assert proc.returncode == 0, proc.stderr
+    assert e.clip() == b"alice@example.com"
+    assert e.pin_log() == ["GETPIN"]
+    check = e.run("--check")
+    assert "age-agent is installed but not set up" in check.stdout
+
+
+@pytest.mark.skipif(
+    not (AGE_AGENT_DIR and Path(AGE_AGENT_DIR, "age-plugin-agent").exists()),
+    reason="needs age-agent and age-plugin-agent",
+)
+def test_real_age_agent_set_up_but_not_exported(run_env: Env) -> None:
+    # `age-agent setup` was run, but PASSAGE_IDENTITIES_FILE still names the
+    # encrypted file, as in a hotkey launch that misses the shell's exports.
+    e = run_env
+    assert AGE_AGENT_DIR is not None
+    runtime = e.tmp / "run"
+    runtime.mkdir(mode=0o700)
+    e.env["XDG_RUNTIME_DIR"] = str(runtime)
+    bindir, rest = e.env["PATH"].split(os.pathsep, 1)
+    e.env["PATH"] = os.pathsep.join([bindir, AGE_AGENT_DIR, rest])
+    answer_passphrase_prompts(["age-agent", "setup", str(e.identities)], PASSPHRASE, 1, e.env)
+    try:
+        e.pins("wrong", PASSPHRASE)
+        proc = e.run("--entry", "web/example.com", "--action", "copy-username")
+        assert proc.returncode == 0, proc.stderr
+        assert e.clip() == b"alice@example.com"
+        log = e.pin_log()
+        assert log[0] == "GETPIN" and log[1].startswith("SETERROR") and log[2:] == ["GETPIN"]
+
+        # Unlocked now: no prompt (an empty pin list would cancel one).
+        e.pins()
+        proc = e.run("--entry", "web/other.org/work", "--action", "copy-username")
+        assert proc.returncode == 0, proc.stderr
+        assert e.clip() == b"bob"
+        assert e.pin_log() == log
+        assert "unlock: age-agent (unlocked" in e.run("--check").stdout
+    finally:
+        subprocess.run(["age-agent", "stop"], env=e.env, capture_output=True, check=False)
 
 
 def test_per_run_wrong_passphrase_retries(run_env: Env) -> None:

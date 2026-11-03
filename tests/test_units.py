@@ -9,6 +9,7 @@ import pytest
 
 from rofi_passage import agent, config, launcher, tools, typer
 from rofi_passage.errors import Cancelled, RofiPassageError
+from rofi_passage.passage import Passage
 
 # --- config ---
 
@@ -147,6 +148,104 @@ def test_classify() -> None:
     assert agent.classify(b"# created\nAGE-SECRET-KEY-1XYZ\n") is agent.Mode.PLAINTEXT
     assert agent.classify(b"AGE-PLUGIN-YUBIKEY-1ABC\n") is agent.Mode.PLUGIN
     assert agent.classify(b"garbage") is None
+
+
+ENCRYPTED = b"age-encryption.org/v1\n-> scrypt ..."
+STUB = b"# recipient: age1xyz\nAGE-PLUGIN-AGENT-1ABC\n"
+
+
+@pytest.fixture
+def ids_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An identities file, an empty XDG_CONFIG_HOME, age-agent and its plugin on PATH."""
+    monkeypatch.setenv("PASSAGE_IDENTITIES_FILE", str(tmp_path / "identities"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(tools, "which", lambda n: f"/usr/bin/{n}")
+    monkeypatch.setattr(agent, "agent_status", lambda: (1, {"locked": True}))
+    return tmp_path
+
+
+def setup_agent(root: Path, served: Path, stub: bytes = STUB) -> Path:
+    """What `age-agent setup <served>` writes."""
+    cfg = root / "config/age-agent"
+    cfg.mkdir(parents=True)
+    (cfg / "config.toml").write_text(f'[[identity]]\nfile = "{served}"\nrefs = ["5d1c"]\n')
+    (cfg / "identities.txt").write_bytes(stub)
+    return cfg / "identities.txt"
+
+
+@pytest.mark.parametrize(
+    ("content", "mode"),
+    [
+        (STUB, agent.Mode.AGENT),
+        (ENCRYPTED, agent.Mode.PER_RUN),  # age-agent not set up for it
+        (b"AGE-SECRET-KEY-1XYZ\n", agent.Mode.PLAINTEXT),
+        (b"AGE-PLUGIN-YUBIKEY-1ABC\n", agent.Mode.PLUGIN),
+    ],
+)
+def test_detect_with_age_agent(ids_env: Path, content: bytes, mode: agent.Mode) -> None:
+    (ids_env / "identities").write_bytes(content)
+    det = agent.detect()
+    assert det.mode is mode
+    assert det.identities == ids_env / "identities"
+    assert det.agent_unused is (mode is agent.Mode.PER_RUN)
+
+
+def test_detect_finds_the_stub_for_an_encrypted_file(ids_env: Path) -> None:
+    # The user's shell exports PASSAGE_IDENTITIES_FILE=<stub>; a hotkey launch does not.
+    ids = ids_env / "identities"
+    ids.write_bytes(ENCRYPTED)
+    stub = setup_agent(ids_env, ids)
+    det = agent.detect()
+    assert (det.mode, det.identities) == (agent.Mode.AGENT, stub)
+
+
+def test_detect_ignores_a_stub_serving_another_file(ids_env: Path) -> None:
+    ids = ids_env / "identities"
+    ids.write_bytes(ENCRYPTED)
+    other = ids_env / "other"
+    other.write_bytes(ENCRYPTED)
+    setup_agent(ids_env, other)
+    assert agent.detect().mode is agent.Mode.PER_RUN
+
+
+def test_detect_without_age_agent(ids_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ids = ids_env / "identities"
+    ids.write_bytes(ENCRYPTED)
+    setup_agent(ids_env, ids)
+    det = agent.detect(use_agent=False)
+    assert (det.mode, det.agent_unused) == (agent.Mode.PER_RUN, False)
+    monkeypatch.setattr(agent, "agent_status", lambda: None)
+    assert agent.detect().mode is agent.Mode.PER_RUN
+
+
+def test_detect_stub_without_plugin(ids_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (ids_env / "identities").write_bytes(STUB)
+    monkeypatch.setattr(tools, "which", lambda n: None if n == "age-plugin-agent" else n)
+    with pytest.raises(RofiPassageError, match="age-plugin-agent is not on PATH"):
+        agent.detect()
+
+
+def test_detect_without_identities_file(ids_env: Path) -> None:
+    with pytest.raises(RofiPassageError, match="Cannot read identities file"):
+        agent.detect()
+
+
+def test_agent_unlock_payload_escapes_the_passphrase() -> None:
+    assert agent._json_string(bytearray(b'a"b\\c\nd\xc3\xa9')) == bytearray(
+        b'a\\"b\\\\c\\u000ad\xc3\xa9'
+    )
+
+
+def test_passage_error_shows_ages_error_line() -> None:
+    stderr = (
+        b"age: error: failed to decrypt identity file: could not read passphrase\n"
+        b"age: report unexpected or unhelpful errors at https://filippo.io/age/report\n"
+    )
+    proc = subprocess.CompletedProcess(["passage"], 1, b"", stderr)
+    err = Passage._error(proc, "Cannot decrypt x")
+    assert "failed to decrypt identity file" in str(err)
+    proc = subprocess.CompletedProcess(["passage"], 1, b"", b"Error: x is not in the store\n")
+    assert "not in the store" in str(Passage._error(proc, "Cannot decrypt x"))
 
 
 def test_pick_pinentry(monkeypatch: pytest.MonkeyPatch) -> None:

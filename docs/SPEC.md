@@ -70,7 +70,7 @@ Every run starts at the entry menu, which lists names without decrypting anythin
 
 1. **Hotkey** runs `rofi-passage`.
 2. **Entry menu:** entry names from the store, fuzzy-matched. Enter runs the default action; a hotkey runs any other action directly; `Alt+m` opens the action menu for the selected entry.
-3. **Unlock check:** before the first decryption, if `age-agent status` reports locked, rofi-passage runs `age-agent unlock` through pinentry so no prompt ever waits behind the launcher. Without age-agent, rofi-passage unlocks for this run only (see Unlocking).
+3. **Unlock check:** before the first decryption, if age-agent is locked, rofi-passage asks the passphrase through its pinentry and unlocks it over age-agent's socket, so no prompt ever waits behind the launcher. Without age-agent, rofi-passage unlocks for this run only (see Unlocking).
 4. **Action** runs, then rofi-passage exits. A notification confirms copies ("Password copied, clears in 45 s") and errors.
 
 | Action | Default key | What happens |
@@ -94,14 +94,14 @@ age-agent is optional: every action works without it, and installing it only cut
 
 | Identity setup | How rofi-passage decrypts | Prompts |
 | --- | --- | --- |
-| age-agent installed (stub identities file) | `passage show` with the stub file; `age-agent unlock` through pinentry when locked | Once per session |
+| age-agent set up (`age-agent setup` wrote a stub identities file) | `passage show` with the stub file; unlock over the socket with a pinentry passphrase when locked | Once per session |
 | Passphrase-protected identity file, no age-agent | Per-run unlock (UNL-2 to UNL-4) | Once per run |
 | Plaintext identity file | `passage show` directly | None; `--check` warns that the key is unprotected at rest |
 | Plugin identity only (for example YubiKey) | `passage show` directly; the plugin handles PIN and touch | As the plugin decides |
 
 | ID | Requirement | Priority |
 | --- | --- | --- |
-| UNL-1 | Mode detection, in order: `age-agent` on `PATH` and `age-agent status --json` exits 0 or 1 → agent mode. Otherwise read the identities file (`PASSAGE_IDENTITIES_FILE`, default `~/.passage/identities`): an age-encrypted file → per-run mode; `AGE-SECRET-KEY-` lines → plaintext mode; only `AGE-PLUGIN-` lines → plugin mode; missing or unreadable → a notification naming the file | Must |
+| UNL-1 | Mode detection, in order: `age-agent` and `age-plugin-agent` on `PATH`, `age-agent status --json` exits 0, 1 or 2, and either the identities file holds `AGE-PLUGIN-AGENT-` stubs, or it is the encrypted file that age-agent's `config.toml` serves, in which case passage gets age-agent's stub file (`~/.config/age-agent/identities.txt`) whatever the environment says → agent mode. Otherwise read the identities file (`PASSAGE_IDENTITIES_FILE`, default `~/.passage/identities`): an age-encrypted file → per-run mode; `AGE-SECRET-KEY-` lines → plaintext mode; only `AGE-PLUGIN-` lines → plugin mode; missing or unreadable → a notification naming the file | Must |
 | UNL-2 | Per-run unlock: ask the passphrase through pinentry (configurable, default `pinentry`, which picks the launcher's own pinentry when installed — `pinentry-rofi`, `pinentry-bemenu` — else the first graphical one), then run `age -d` on the identities file with a private pseudo-terminal as its controlling terminal, answer its prompt there, and read the decrypted identity from a stdout pipe | Must |
 | UNL-3 | The decrypted identity lives only in a sealed `memfd` (no writes, no resize after filling) and reaches passage as `PASSAGE_IDENTITIES_FILE=/dev/fd/N` through an inherited descriptor. It is closed when the run ends and never touches disk, argv or the environment (only the `/dev/fd` path does) | Must |
 | UNL-4 | One passphrase serves every decryption of a run (for example REC-2's write and verify). The passphrase sits in a `bytearray` that is overwritten after use; 3 attempts; 60 s prompt timeout; cancel stops the action without side effects | Must |
@@ -121,7 +121,7 @@ Must items make 1.0; Should items follow in 1.x; Could items wait for demand.
 | LST-2 | Most-recently-used entries first, from a cache of names only (`$XDG_CACHE_HOME/rofi-passage/mru`, mode 600, no secrets) | Should |
 | LST-3 | Several stores in the config, switched with a key, each with its own `PASSAGE_DIR` | Could |
 | DEC-1 | Every read goes through `passage show <name>`; output is held in memory only, never written to a file | Must |
-| DEC-2 | Before the first decryption of a run, pick the unlock mode (UNL-1); in agent mode, if `age-agent status --json` reports locked, run `age-agent unlock` (pinentry) and stop on cancel | Must |
+| DEC-2 | Before the first decryption of a run, pick the unlock mode (UNL-1); in agent mode, if the agent is locked (or not running: start it with `age-agent daemon`), ask the passphrase through pinentry and send age-agent's socket `unlock` request with the current lock epoch, 3 attempts; stop on cancel. `age-agent unlock` is not used: it prompts on a terminal only | Must |
 | DEC-3 | Without age-agent, a passphrase-protected identity is unlocked once per run (UNL-2 to UNL-4); only a missing or unreadable identity ends in an error notification | Must |
 | CLP-1 | Copy through `wl-copy --sensitive` on Wayland (wl-clipboard 2.3.0 or newer, so clipboard managers such as cliphist skip it) and `xclip` on X11; the value goes through stdin | Must |
 | CLP-2 | Clear after the timeout (default 45 s) only if the clipboard still holds the copied value, then restore the previous text content | Must |
@@ -227,7 +227,7 @@ Python 3.11+ with the standard library only. Bash was ruled out: computing TOTP 
 | `totp` | RFC 6238 with SHA1, SHA256, SHA512 |
 | `launcher` | rofi, fuzzel, wofi, bemenu adapters |
 | `clipboard`, `typer` | Tool detection, stdin-only I/O, clear-after-timeout helper |
-| `agent` | Unlock mode detection (UNL-1); `age-agent status --json` and `unlock` calls; the per-run fallback: pinentry, pseudo-terminal `age -d`, sealed memfd |
+| `agent` | Unlock mode detection (UNL-1); `age-agent status --json`, stub lookup and the socket `unlock`; the per-run fallback: pinentry, pseudo-terminal `age -d`, sealed memfd |
 | `actions`, `cli` | Flows and flags |
 
 **Tests**

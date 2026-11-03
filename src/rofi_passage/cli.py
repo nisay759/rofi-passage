@@ -61,14 +61,22 @@ def check(cfg: config.Config) -> int:
         status = agent.agent_status()
         if status is not None:
             state = "locked" if agent.is_locked(*status) else "unlocked"
-        print(f"unlock: age-agent ({state})")
+            if status[0] == 2:
+                state = "not running"
+        print(f"unlock: age-agent ({state}, {det.identities})")
     else:
         print(f"unlock: {det.mode.value} ({det.identities})")
     if det.mode is Mode.PER_RUN:
         print(f"pinentry: {agent.pick_pinentry(cfg.pinentry, _launcher_name(cfg))}")
-        warnings.append(
-            "installing age-agent would cut prompts from one per run to one per session"
-        )
+        if det.agent_unused:
+            warnings.append(
+                f"age-agent is installed but not set up for {det.identities}; "
+                "run `age-agent setup` on it to cut prompts to one per session"
+            )
+        else:
+            warnings.append(
+                "installing age-agent would cut prompts from one per run to one per session"
+            )
     if det.mode is Mode.PLAINTEXT:
         warnings.append(f"{det.identities} is not encrypted: the key is unprotected at rest")
     for w in warnings:
